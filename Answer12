@@ -1,0 +1,69 @@
+dataset_path = '/home/hp/books/D184MB/*.txt'  
+
+# Method 1: Load as text files, create DataFrame
+raw_df = spark.read.text(dataset_path)
+booksdf = raw_df.withColumn("filename", input_file_name()) \
+                .withColumn("text", col("value")) \
+                .select("filename", "text")
+
+booksdf = booksdf.withColumn("filename", regexp_replace(col("filename"), ".*/", ""))  # Clean filename
+booksdf.show(5, truncate=False)
+
+# Extract Author & Year
+
+import re
+from pyspark.sql.functions import udf
+from pyspark.sql.types import StringType, IntegerType
+
+@udf(StringType())
+def extract_author(text):
+    text = text[:5000]  # Header usually first 5K chars
+    match = re.search(r'Author:\s*(.*?)(?=\*\*\*|Produced by|\n\n|\*\*\*\s|$)', 
+                     text, re.IGNORECASE | re.DOTALL)
+    return match.group(1).strip() if match else "Unknown"
+
+@udf(IntegerType())
+def extract_year(text):
+    text = text[:5000]
+    patterns = [r'(\d{4})\s*\(most recent', r'Release.*?(\d{4})', r'(\d{4})\s*Project Gutenberg']
+    for pat in patterns:
+        match = re.search(pat, text)
+        if match:
+            return int(match.group(1))
+    return None
+
+booksdf = booksdf.withColumn("author", extract_author(col("text"))) \
+                 .withColumn("year", extract_year(col("text"))) \
+                 .filter(col("author") != "Unknown") \
+                 .filter(col("year").isNotNull())
+
+booksdf.select("filename", "author", "year").show(10)
+
+# Create Edges (X=5 Years)
+
+X = 5
+
+influence_edges = booksdf.alias("a1").join(
+    booksdf.alias("a2"),
+    (col("a1.filename") != col("a2.filename")) & 
+    (abs(col("a1.year") - col("a2.year")) <= X),
+    "inner"
+).select(
+    col("a1.author").alias("author1"),
+    col("a2.author").alias("author2")
+).distinct()
+
+influence_edges.show(10)
+
+#Top 5 Degrees
+
+in_degrees = influence_edges.groupBy("author2").agg(count("*").alias("in_degree")).orderBy(desc("in_degree"))
+out_degrees = influence_edges.groupBy("author1").agg(count("*").alias("out_degree")).orderBy(desc("out_degree"))
+
+print("Top 5 Most Influenced:")
+in_degrees.limit(5).show()
+
+print("Top 5 Most Influential:")  
+out_degrees.limit(5).show()
+
+influence_edges.write.mode("overwrite").parquet("influence_edges")
